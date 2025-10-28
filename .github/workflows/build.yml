@@ -42,7 +42,8 @@ jobs:
           DEBIAN_FRONTEND=noninteractive apt-get install -y \
             build-essential git wget curl cmake golang-go \
             automake gcc g++ make tar autoconf libtool pkg-config \
-            zlib1g-dev libssl-dev libpcre3-dev perl ca-certificates &&
+            zlib1g-dev libssl-dev libpcre3-dev perl ca-certificates \
+            libbrotli-dev &&
           apt-get clean &&
 
           cd /opt/nginx &&
