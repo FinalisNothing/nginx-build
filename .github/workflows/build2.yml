@@ -1,0 +1,109 @@
+name: Build Nginx 1.29.3 with Hidden Version for Debian 12
+
+on:
+  workflow_dispatch:
+    inputs:
+      fake_server_name:
+        description: "伪装的服务器名称"
+        required: true
+        default: "Microsoft-IIS"
+      fake_version:
+        description: "伪装的版本号"
+        required: true
+        default: "10.0"
+      fake_version_code:
+        description: "伪装的版本代码"
+        required: true
+        default: "1000000"
+      prefix:
+        description: "安装路径"
+        required: true
+        default: "/nginx"
+
+jobs:
+  build-nginx:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Pull Debian 12 Docker image
+      run: |
+        docker pull debian:12
+
+    - name: Run Docker container and build Nginx
+      run: |
+        docker run --rm -v ${{ github.workspace }}:/opt/nginx debian:12 /bin/bash -c "
+          set -e
+          
+          # 安装依赖（Debian 12 版本）
+          apt-get update &&
+          DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            build-essential git wget curl cmake golang-go \
+            automake gcc g++ make tar autoconf libtool pkg-config \
+            zlib1g-dev libssl-dev libpcre3-dev perl ca-certificates \
+            libbrotli-dev &&
+          apt-get clean &&
+
+          cd /opt/nginx &&
+          git clone --depth 1 --recurse-submodules https://github.com/quictls/openssl.git openssl &&
+
+          cd /opt/nginx &&
+          git clone --depth 1 --recurse-submodules https://github.com/jemalloc/jemalloc.git jemalloc &&
+          cd jemalloc && ./autogen.sh && make -j\$(nproc) && make install && make clean &&
+          ln -s /usr/local/lib/libjemalloc.so.2 /usr/lib/libjemalloc.so.2 &&
+          ln -s /usr/local/lib/libjemalloc.so.2 /usr/lib/x86_64-linux-gnu/libjemalloc.so.2 &&
+          ldconfig &&
+
+          cd /opt/nginx &&
+          git clone --depth 1 --recurse-submodules https://github.com/google/ngx_brotli.git ngx_brotli &&
+          cd ngx_brotli && git submodule update --init &&
+
+          cd /opt/nginx &&
+          git clone --depth 1 --recurse-submodules https://github.com/facebook/zstd.git zstd &&
+          cd zstd && make -j\$(nproc) && make install && make clean && ldconfig &&
+          cd /opt/nginx &&
+          git clone --depth 1 --recurse-submodules https://github.com/tokers/zstd-nginx-module.git ngx_zstd &&
+          
+          cd /opt/nginx &&
+          git clone --depth 1 --recurse-submodules https://github.com/PCRE2Project/pcre2.git pcre2 &&
+          cd pcre2 && ./autogen.sh && ./configure && make -j\$(nproc) && make install && make clean && ldconfig &&
+
+          cd /opt/nginx &&
+          wget https://nginx.org/download/nginx-1.29.3.tar.gz &&
+          tar -zxvf nginx-1.29.3.tar.gz && cd nginx-1.29.3 &&
+          
+          # 修改源码隐藏版本信息
+          sed -i 's/#define nginx_version      [0-9]*/#define nginx_version      ${{ github.event.inputs.fake_version_code }}/g' src/core/nginx.h &&
+          sed -i 's/#define NGINX_VERSION      \".*\"/#define NGINX_VERSION      \"${{ github.event.inputs.fake_version }}\"/g' src/core/nginx.h &&
+          sed -i 's/#define NGINX_VER          \"nginx\/\" NGINX_VERSION/#define NGINX_VER          \"${{ github.event.inputs.fake_server_name }}\/\" NGINX_VERSION/g' src/core/nginx.h &&
+          sed -i 's/#define NGINX_VAR          \"NGINX\"/#define NGINX_VAR          \"${{ github.event.inputs.fake_server_name }}\"/g' src/core/nginx.h &&
+          sed -i 's/static u_char ngx_http_server_string\[\] = \"Server: nginx\" CRLF;/static u_char ngx_http_server_string[] = \"Server: ${{ github.event.inputs.fake_server_name }}\" CRLF;/g' src/http/ngx_http_header_filter_module.c &&
+          sed -i 's/<hr><center>nginx<\\/center>/<hr><center>${{ github.event.inputs.fake_server_name }}<\\/center>/g' src/http/ngx_http_special_response.c &&
+          sed -i 's/\"<hr><center>\" NGINX_VER \"<\\/center>\"/\"<hr><center>${{ github.event.inputs.fake_server_name }}<\\/center>\"/g' src/http/ngx_http_special_response.c &&
+          sed -i 's/\"<hr><center>\" NGINX_VER_BUILD \"<\\/center>\"/\"<hr><center>${{ github.event.inputs.fake_server_name }}<\\/center>\"/g' src/http/ngx_http_special_response.c &&
+          
+          ./configure --prefix=\${{ github.event.inputs.prefix }} \
+                      --with-threads --with-file-aio \
+                      --with-http_v2_module --with-http_v3_module --with-http_ssl_module \
+                      --with-http_sub_module --with-http_slice_module --with-http_realip_module \
+                      --with-http_degradation_module --with-http_stub_status_module \
+                      --with-pcre-jit --with-pcre=../pcre2 \
+                      --with-stream --with-stream_ssl_module --with-stream_ssl_preread_module \
+                      --with-openssl=../openssl --add-module=../ngx_zstd --add-module=../ngx_brotli \
+                      --with-ld-opt='-ljemalloc -Wl,-z,relro,-z,now -flto' \
+                      --with-openssl-opt='no-weak-ssl-ciphers enable-ec_nistp_64_gcc_128 enable-tls1_3 enable-quic' \
+                      --with-cc-opt='-O3 -march=x86-64 -mtune=generic -funroll-loops -fprefetch-loop-arrays -fstack-protector-strong -D_FORTIFY_SOURCE=2 -fPIC -pipe -flto' &&
+          make -j\$(nproc) && objs/./nginx -V &> /opt/nginx/nginx_build_info.txt && mv objs/nginx /opt/nginx/
+        "
+
+    - name: Upload Nginx binary and build information
+      uses: actions/upload-artifact@v4
+      with:
+        name: nginx-1.29.3-debian12-hidden
+        path: |
+          ${{ github.workspace }}/nginx
+          ${{ github.workspace }}/nginx_build_info.txt
+        retention-days: 90
+
