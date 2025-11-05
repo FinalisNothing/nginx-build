@@ -1,4 +1,4 @@
-name: Build Nginx 1.28.0 with OpenSSL 3.5 and Post-Quantum Crypto for Debian 12
+name: Build Nginx 1.29.3 with OpenSSL 3.5 and Post-Quantum Crypto for Debian 12
 
 on:
   workflow_dispatch:
@@ -22,7 +22,7 @@ on:
 
 jobs:
   build-nginx:
-    runs-on: Debian 12
+    runs-on: ubuntu-latest
 
     steps:
     - name: Checkout repository
@@ -73,9 +73,9 @@ jobs:
           cd pcre2 && ./autogen.sh && ./configure && make -j\$(nproc) && make install && make clean &&
 
           cd /opt/nginx &&
-          # 修改: 使用 Nginx 1.28.0（LTS 版本）
-          wget https://nginx.org/download/nginx-1.28.0.tar.gz &&
-          tar -zxf nginx-1.28.0.tar.gz && cd nginx-1.28.0 &&
+          # 保持原版本: Nginx 1.29.3（主线版本，包含最新特性）
+          wget https://nginx.org/download/nginx-1.29.3.tar.gz &&
+          tar -zxf nginx-1.29.3.tar.gz && cd nginx-1.29.3 &&
           
           # 修改源码隐藏版本信息（原有逻辑完全保留）
           sed -i 's/#define nginx_version      [0-9]*/#define nginx_version      ${{ github.event.inputs.fake_version_code }}/g' src/core/nginx.h &&  # 隐藏版本号
@@ -106,7 +106,7 @@ jobs:
     - name: Upload Nginx binary and build information
       uses: actions/upload-artifact@v4
       with:
-        name: nginx-1.28.0-openssl35-debian12-hidden
+        name: nginx-1.29.3-openssl35-debian12-hidden
         path: |
           ${{ github.workspace }}/nginx
           ${{ github.workspace }}/nginx_build_info.txt
