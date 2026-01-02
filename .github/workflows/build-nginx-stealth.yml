@@ -33,9 +33,9 @@ jobs:
 
       - name: Build in Debian 13 container
         env:
-          PREFIX: ${{ inputs.install_prefix }}
-          CHANNEL: ${{ inputs.channel }}
-          FASTCGI_SERVER_SOFTWARE: ${{ inputs.fastcgi_server_software }}
+          PREFIX: ${{ github.event.inputs.install_prefix }}
+          CHANNEL: ${{ github.event.inputs.channel }}
+          FASTCGI_SERVER_SOFTWARE: ${{ github.event.inputs.fastcgi_server_software }}
         run: |
           set -euxo pipefail
 
@@ -151,6 +151,33 @@ jobs:
                   continue
               s = wrap_at(s, pos)
 
+          # If we compiled out Server header emission, some file-scope Server strings become unused under -Werror.
+          # Wrap them too to avoid -Werror=unused-variable.
+          if path.endswith('src/http/ngx_http_header_filter_module.c'):
+              decls = [
+                  'static u_char ngx_http_server_string[]',
+                  'static u_char ngx_http_server_full_string[]',
+                  'static u_char ngx_http_server_build_string[]',
+              ]
+              idxs = []
+              for d in decls:
+                  m2 = re.search(r'^\s*' + re.escape(d) + r'.*$', s, flags=re.M)
+                  if not m2:
+                      raise SystemExit(f"{path}: missing declaration for {d}")
+                  idxs.append(m2.start())
+              first = min(idxs)
+              last = max(idxs)
+              ls0 = s.rfind("\n", 0, first) + 1
+              indent0 = re.match(r"[ \t]*", s[ls0:first]).group(0)
+              guard = f"{indent0}#if !defined(NGX_STEALTH_NO_SERVER_HEADER)\n"
+              if 'NGX_STEALTH_NO_SERVER_HEADER' not in s[max(0, ls0-200):ls0]:
+                  s = s[:ls0] + guard + s[ls0:]
+                  last += len(guard)
+              le = s.find("\n", last)
+              le = len(s) if le == -1 else le + 1
+              endif = f"{indent0}#endif\n"
+              if 'NGX_STEALTH_NO_SERVER_HEADER' not in s[max(0, le-200):le]:
+                  s = s[:le] + endif + s[le:]
           with open(path, "w", encoding="utf-8") as fh:
               fh.write(s)
           PY
