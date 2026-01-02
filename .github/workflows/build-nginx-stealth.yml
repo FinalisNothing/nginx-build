@@ -178,6 +178,35 @@ jobs:
               endif = f"{indent0}#endif\n"
               if 'NGX_STEALTH_NO_SERVER_HEADER' not in s[max(0, le-200):le]:
                   s = s[:le] + endif + s[le:]
+
+          # HTTP/2 module: function-local static variables for Server header
+          if path.endswith('src/http/v2/ngx_http_v2_filter_module.c'):
+              v2_decls = [
+                  'static const u_char nginx[',
+                  'static size_t nginx_ver_len',
+                  'static u_char nginx_ver[',
+                  'static size_t nginx_ver_build_len',
+                  'static u_char nginx_ver_build[',
+              ]
+              idxs = []
+              for d in v2_decls:
+                  m2 = re.search(r'^\s*' + re.escape(d) + r'.*$', s, flags=re.M)
+                  if m2:
+                      idxs.append(m2.start())
+              if idxs:
+                  first = min(idxs)
+                  last = max(idxs)
+                  ls0 = s.rfind("\n", 0, first) + 1
+                  indent0 = re.match(r"[ \t]*", s[ls0:first]).group(0)
+                  guard = f"{indent0}#if !defined(NGX_STEALTH_NO_SERVER_HEADER)\n"
+                  if 'NGX_STEALTH_NO_SERVER_HEADER' not in s[max(0, ls0-200):ls0]:
+                      s = s[:ls0] + guard + s[ls0:]
+                      last += len(guard)
+                  le = s.find("\n", last)
+                  le = len(s) if le == -1 else le + 1
+                  endif = f"{indent0}#endif\n"
+                  if 'NGX_STEALTH_NO_SERVER_HEADER' not in s[max(0, le-200):le]:
+                      s = s[:le] + endif + s[le:]
           with open(path, "w", encoding="utf-8") as fh:
               fh.write(s)
           PY
