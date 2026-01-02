@@ -320,8 +320,7 @@ jobs:
               add_header alt-svc 'h3=":8443"; ma=86400' always;
 
               location = /error.html { root /work/_run/html; internal; }
-              location / { return 200 "ok
-"; }
+              location / { return 200 "ok\n"; }
             }
           }
           CONF
