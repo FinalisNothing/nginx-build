@@ -246,6 +246,11 @@ jobs:
           wrap_file src/http/v2/ngx_http_v2_filter_module.c
           wrap_file src/http/v3/ngx_http_v3_filter_module.c
 
+          # 1.5) 错误页 footer 硬编码 nginx（server_tokens off 时使用）
+          cp src/http/ngx_http_special_response.c src/http/ngx_http_special_response.c.orig
+          sed -i 's/<hr><center>nginx<\/center>/<hr><center><\/center>/g' src/http/ngx_http_special_response.c
+          mkdiff_restore src/http/ngx_http_special_response.c
+
           # 2) NGINX_VERSION / NGINX_VER：仅展示层（不动 nginx_version 数值、不动 NGINX_VAR）
           cp src/core/nginx.h src/core/nginx.h.orig
           python3 - <<'PY'
