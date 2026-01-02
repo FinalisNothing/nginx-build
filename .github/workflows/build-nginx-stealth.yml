@@ -6,14 +6,15 @@
 # 关键策略：
 # 1) 通过编译期开关彻底禁发 Server 头（HTTP/1.1 + HTTP/2 + HTTP/3）
 # 2) 修复 FastCGI 默认模板的 SERVER_SOFTWARE 泄露（nginx/$nginx_version）
-# 3) 配置层：error_page 自定义错误页 + 可选关闭 msie_padding
+# 3) 配置层：error_page 自定义错误页 + 可选关闭 msie_padding（仅用于 CI 断言）
 #
 # 明确不修改（避免破坏功能与兼容性）：
 # - nginx_version（动态模块版本校验）
 # - NGINX_VAR（USR2 热升级 socket 继承）
 #
-# 注意：本 workflow 默认链接 jemalloc（动态库）。若在目标机未安装 jemalloc，
-# nginx 可能无法启动。若你不需要 jemalloc，建议去掉相关步骤与 -ljemalloc。
+# 说明：你当前 workflow 9 秒结束，是因为 docker run 使用了 heredoc，
+#       但结束标记(BASH)带缩进导致 here-doc 未正确闭合，容器内脚本没执行。
+#       本版本改为：先在 workspace 生成 /work/build.sh，再让容器执行该脚本，避免该类问题。
 # =============================================================================
 
 name: Build Nginx (Stealth) for Debian 13
@@ -48,15 +49,14 @@ jobs:
 
       - name: Build in Debian 13 container
         run: |
-          docker run --rm -v "${{ github.workspace }}:/work" -w /work debian:trixie bash -euxo pipefail <<'BASH'
+          # 1) 在 runner workspace 生成容器内要执行的脚本（挂载到 /work）
+          cat > build.sh <<'BASH'
+          #!/usr/bin/env bash
+          set -euxo pipefail
           export DEBIAN_FRONTEND=noninteractive
 
           apt-get update
-          apt-get install -y --no-install-recommends \
-            ca-certificates curl wget git \
-            build-essential automake autoconf libtool pkg-config cmake \
-            zlib1g-dev libssl-dev \
-            perl patch openssl
+          apt-get install -y --no-install-recommends             ca-certificates curl wget git             build-essential automake autoconf libtool pkg-config cmake             zlib1g-dev libssl-dev             perl patch openssl
           apt-get clean
 
           echo "OpenSSL version:"
@@ -73,10 +73,7 @@ jobs:
           # -------------------------
           CHANNEL='${{ github.event.inputs.nginx_channel }}'
 
-          ALL_VERSIONS="$(curl -fsSL https://nginx.org/download/ \
-            | grep -oE 'nginx-[0-9]+\.[0-9]+\.[0-9]+' \
-            | sed 's/^nginx-//' \
-            | sort -u)"
+          ALL_VERSIONS="$(curl -fsSL https://nginx.org/download/             | grep -oE 'nginx-[0-9]+\.[0-9]+\.[0-9]+'             | sed 's/^nginx-//'             | sort -u)"
 
           if [ "$CHANNEL" = "stable" ]; then
             NGX_VER="$(echo "$ALL_VERSIONS" | awk -F. '($2 % 2)==0 {print}' | sort -V | tail -1)"
@@ -149,125 +146,124 @@ jobs:
           # 4) 应用补丁（patch，而非 sed）
           # -------------------------
           cat > /work/_build/stealth.patch <<'PATCH'
---- a/src/http/ngx_http_header_filter_module.c
-+++ b/src/http/ngx_http_header_filter_module.c
-@@
-     clcf = ngx_http_get_module_loc_conf(r, ngx_http_core_module);
+          --- a/src/http/ngx_http_header_filter_module.c
+          +++ b/src/http/ngx_http_header_filter_module.c
+          @@
+               clcf = ngx_http_get_module_loc_conf(r, ngx_http_core_module);
 
-+#if !defined(NGX_STEALTH_NO_SERVER_HEADER)
-     if (r->headers_out.server == NULL) {
-         if (clcf->server_tokens == NGX_HTTP_SERVER_TOKENS_ON) {
-             len += sizeof(ngx_http_server_full_string) - 1;
-@@
-         }
-     }
-+#endif
+          +#if !defined(NGX_STEALTH_NO_SERVER_HEADER)
+               if (r->headers_out.server == NULL) {
+                   if (clcf->server_tokens == NGX_HTTP_SERVER_TOKENS_ON) {
+                       len += sizeof(ngx_http_server_full_string) - 1;
+          @@
+                   }
+               }
+          +#endif
 
-     if (r->headers_out.date == NULL) {
-@@
-     *b->last++ = CR; *b->last++ = LF;
+               if (r->headers_out.date == NULL) {
+          @@
+               *b->last++ = CR; *b->last++ = LF;
 
-+#if !defined(NGX_STEALTH_NO_SERVER_HEADER)
-     if (r->headers_out.server == NULL) {
-         if (clcf->server_tokens == NGX_HTTP_SERVER_TOKENS_ON) {
-             p = ngx_http_server_full_string;
-             len = sizeof(ngx_http_server_full_string) - 1;
-@@
+          +#if !defined(NGX_STEALTH_NO_SERVER_HEADER)
+               if (r->headers_out.server == NULL) {
+                   if (clcf->server_tokens == NGX_HTTP_SERVER_TOKENS_ON) {
+                       p = ngx_http_server_full_string;
+                       len = sizeof(ngx_http_server_full_string) - 1;
+          @@
 
-         b->last = ngx_cpymem(b->last, p, len);
-     }
-+#endif
+                   b->last = ngx_cpymem(b->last, p, len);
+               }
+          +#endif
 
-     if (r->headers_out.date == NULL) {
+               if (r->headers_out.date == NULL) {
 
---- a/src/http/v2/ngx_http_v2_filter_module.c
-+++ b/src/http/v2/ngx_http_v2_filter_module.c
-@@
-     clcf = ngx_http_get_module_loc_conf(r, ngx_http_core_module);
+          --- a/src/http/v2/ngx_http_v2_filter_module.c
+          +++ b/src/http/v2/ngx_http_v2_filter_module.c
+          @@
+               clcf = ngx_http_get_module_loc_conf(r, ngx_http_core_module);
 
-+#if !defined(NGX_STEALTH_NO_SERVER_HEADER)
-     if (r->headers_out.server == NULL) {
+          +#if !defined(NGX_STEALTH_NO_SERVER_HEADER)
+               if (r->headers_out.server == NULL) {
 
-         if (clcf->server_tokens == NGX_HTTP_SERVER_TOKENS_ON) {
-             len += 1 + nginx_ver_len;
-@@
-         }
-     }
-+#endif
+                   if (clcf->server_tokens == NGX_HTTP_SERVER_TOKENS_ON) {
+                       len += 1 + nginx_ver_len;
+          @@
+                   }
+               }
+          +#endif
 
-     if (r->headers_out.date == NULL) {
-@@
-     }
+               if (r->headers_out.date == NULL) {
+          @@
+               }
 
-+#if !defined(NGX_STEALTH_NO_SERVER_HEADER)
-     if (r->headers_out.server == NULL) {
+          +#if !defined(NGX_STEALTH_NO_SERVER_HEADER)
+               if (r->headers_out.server == NULL) {
 
-         if (clcf->server_tokens == NGX_HTTP_SERVER_TOKENS_ON) {
-             ngx_log_debug1(NGX_LOG_DEBUG_HTTP, fc->log, 0,
-                            "http2 output header: \"server: %s\"",
-@@
-         } else {
-             pos = ngx_cpymem(pos, nginx, sizeof(nginx));
-         }
-     }
-+#endif
+                   if (clcf->server_tokens == NGX_HTTP_SERVER_TOKENS_ON) {
+                       ngx_log_debug1(NGX_LOG_DEBUG_HTTP, fc->log, 0,
+                                      "http2 output header: \"server: %s\"",
+                                      NGINX_VER);
+          @@
+                   } else {
+                       pos = ngx_cpymem(pos, nginx, sizeof(nginx));
+                   }
+               }
+          +#endif
 
-     if (r->headers_out.date == NULL) {
+               if (r->headers_out.date == NULL) {
 
---- a/src/http/v3/ngx_http_v3_filter_module.c
-+++ b/src/http/v3/ngx_http_v3_filter_module.c
-@@
-     clcf = ngx_http_get_module_loc_conf(r, ngx_http_core_module);
+          --- a/src/http/v3/ngx_http_v3_filter_module.c
+          +++ b/src/http/v3/ngx_http_v3_filter_module.c
+          @@
+               clcf = ngx_http_get_module_loc_conf(r, ngx_http_core_module);
 
-+#if !defined(NGX_STEALTH_NO_SERVER_HEADER)
-     if (r->headers_out.server == NULL) {
-         if (clcf->server_tokens == NGX_HTTP_SERVER_TOKENS_ON) {
-             n = sizeof(NGINX_VER) - 1;
-@@
-                                             NGX_HTTP_V3_HEADER_SERVER,
-                                             NULL, n);
-     }
-+#endif
+          +#if !defined(NGX_STEALTH_NO_SERVER_HEADER)
+               if (r->headers_out.server == NULL) {
+                   if (clcf->server_tokens == NGX_HTTP_SERVER_TOKENS_ON) {
+                       n = sizeof(NGINX_VER) - 1;
+          @@
+                                                       NGX_HTTP_V3_HEADER_SERVER,
+                                                       NULL, n);
+               }
+          +#endif
 
-     if (r->headers_out.date == NULL) {
-@@
-     }
+               if (r->headers_out.date == NULL) {
+          @@
+               }
 
-+#if !defined(NGX_STEALTH_NO_SERVER_HEADER)
-     if (r->headers_out.server == NULL) {
-         if (clcf->server_tokens == NGX_HTTP_SERVER_TOKENS_ON) {
-             p = (u_char *) NGINX_VER;
-             n = sizeof(NGINX_VER) - 1;
-@@
-         b->last = (u_char *) ngx_http_v3_encode_field_lri(b->last, 0,
-                                              NGX_HTTP_V3_HEADER_SERVER,
-                                              p, n);
-     }
-+#endif
+          +#if !defined(NGX_STEALTH_NO_SERVER_HEADER)
+               if (r->headers_out.server == NULL) {
+                   if (clcf->server_tokens == NGX_HTTP_SERVER_TOKENS_ON) {
+                       p = (u_char *) NGINX_VER;
+                       n = sizeof(NGINX_VER) - 1;
+          @@
+                   b->last = (u_char *) ngx_http_v3_encode_field_lri(b->last, 0,
+                                                        NGX_HTTP_V3_HEADER_SERVER,
+                                                        p, n);
+               }
+          +#endif
 
-     if (r->headers_out.date == NULL) {
+               if (r->headers_out.date == NULL) {
 
---- a/conf/fastcgi.conf
-+++ b/conf/fastcgi.conf
-@@
--fastcgi_param  SERVER_SOFTWARE    nginx/$nginx_version;
-+fastcgi_param  SERVER_SOFTWARE    "";
+          --- a/conf/fastcgi.conf
+          +++ b/conf/fastcgi.conf
+          @@
+          -fastcgi_param  SERVER_SOFTWARE    nginx/$nginx_version;
+          +fastcgi_param  SERVER_SOFTWARE    "";
 
---- a/conf/fastcgi_params
-+++ b/conf/fastcgi_params
-@@
--fastcgi_param  SERVER_SOFTWARE    nginx/$nginx_version;
-+fastcgi_param  SERVER_SOFTWARE    "";
-PATCH
+          --- a/conf/fastcgi_params
+          +++ b/conf/fastcgi_params
+          @@
+          -fastcgi_param  SERVER_SOFTWARE    nginx/$nginx_version;
+          +fastcgi_param  SERVER_SOFTWARE    "";
+          PATCH
 
-          # 绝不允许模糊匹配：一旦上游结构变化，直接失败，强制你手动 review
           patch -p1 --dry-run --fuzz=0 < /work/_build/stealth.patch
           patch -p1 --fuzz=0 < /work/_build/stealth.patch
 
-          # 可选：覆盖 FastCGI SERVER_SOFTWARE（如果你希望是某个通用值或留空）
+          # 可选：覆盖 FastCGI SERVER_SOFTWARE
           if [ -n "${{ github.event.inputs.server_software_fastcgi }}" ]; then
-            perl -0777 -pe 's/fastcgi_param\s+SERVER_SOFTWARE\s+"";/fastcgi_param  SERVER_SOFTWARE    "${{ github.event.inputs.server_software_fastcgi }}";/g' \
-              -i conf/fastcgi.conf conf/fastcgi_params
+            perl -0777 -pe 's/fastcgi_param\s+SERVER_SOFTWARE\s+"";/fastcgi_param  SERVER_SOFTWARE    "${{ github.event.inputs.server_software_fastcgi }}";/g'               -i conf/fastcgi.conf conf/fastcgi_params
           fi
 
           # -------------------------
@@ -278,21 +274,7 @@ PATCH
           CC_OPT='-O3 -fstack-protector-strong -D_FORTIFY_SOURCE=2 -fPIC -pipe -flto -DNGX_STEALTH_NO_SERVER_HEADER'
           LD_OPT='-Wl,-z,relro,-z,now -Wl,-rpath,/usr/local/lib -L/usr/local/lib -ljemalloc -flto'
 
-          ./configure --prefix="$PREFIX" \
-            --with-threads --with-file-aio \
-            --with-http_ssl_module \
-            --with-http_v2_module \
-            --with-http_v3_module \
-            --with-http_stub_status_module \
-            --with-http_realip_module \
-            --with-http_slice_module \
-            --with-http_sub_module \
-            --with-pcre-jit --with-pcre=/work/_build/pcre2 \
-            --with-stream --with-stream_ssl_module --with-stream_ssl_preread_module \
-            --add-module=/work/_build/ngx_brotli \
-            --add-module=/work/_build/ngx_zstd \
-            --with-cc-opt="$CC_OPT" \
-            --with-ld-opt="$LD_OPT"
+          ./configure --prefix="$PREFIX"             --with-threads --with-file-aio             --with-http_ssl_module             --with-http_v2_module             --with-http_v3_module             --with-http_stub_status_module             --with-http_realip_module             --with-http_slice_module             --with-http_sub_module             --with-pcre-jit --with-pcre=/work/_build/pcre2             --with-stream --with-stream_ssl_module --with-stream_ssl_preread_module             --add-module=/work/_build/ngx_brotli             --add-module=/work/_build/ngx_zstd             --with-cc-opt="$CC_OPT"             --with-ld-opt="$LD_OPT"
 
           make -j"$(nproc)"
 
@@ -304,51 +286,45 @@ PATCH
           # -------------------------
           mkdir -p /work/_run/conf /work/_run/logs /work/_run/html
 
-          openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
-            -subj "/CN=localhost" \
-            -keyout /work/_run/conf/key.pem \
-            -out /work/_run/conf/cert.pem
+          openssl req -x509 -newkey rsa:2048 -nodes -days 1             -subj "/CN=localhost"             -keyout /work/_run/conf/key.pem             -out /work/_run/conf/cert.pem
 
           cat > /work/_run/html/error.html <<'HTML'
-<!doctype html><html><head><meta charset="utf-8"><title>Error</title></head>
-<body><h1>Request failed</h1></body></html>
-HTML
+          <!doctype html><html><head><meta charset="utf-8"><title>Error</title></head>
+          <body><h1>Request failed</h1></body></html>
+          HTML
 
           cat > /work/stealth_nginx.conf <<'CONF'
-worker_processes  1;
-error_log  /work/_run/logs/error.log notice;
-pid        /work/_run/nginx.pid;
+          worker_processes  1;
+          error_log  /work/_run/logs/error.log notice;
+          pid        /work/_run/nginx.pid;
 
-events { worker_connections  1024; }
+          events { worker_connections  1024; }
 
-http {
-  access_log  /work/_run/logs/access.log;
+          http {
+            access_log  /work/_run/logs/access.log;
 
-  # 仅作为防御性设置：即便未来你取消补丁，也不暴露版本号
-  server_tokens off;
+            server_tokens off;
+            msie_padding off;
 
-  # 关闭 MSIE/Chrome padding 注释（减少内置错误页特征）
-  msie_padding off;
+            error_page 400 401 403 404 405 408 410 411 412 413 414 415 416 417 418 421 429 494 495 496 497 500 501 502 503 504 /error.html;
 
-  # 用自定义错误页替代内置 special_response HTML
-  error_page 400 401 403 404 405 408 410 411 412 413 414 415 416 417 418 421 429 494 495 496 497 500 501 502 503 504 /error.html;
+            server {
+              listen 8443 ssl http2;
+              listen 8443 quic reuseport;
+              http3 on;
 
-  server {
-    listen 8443 ssl http2;
-    listen 8443 quic reuseport;
-    http3 on;
+              ssl_certificate     /work/_run/conf/cert.pem;
+              ssl_certificate_key /work/_run/conf/key.pem;
+              ssl_protocols TLSv1.3;
 
-    ssl_certificate     /work/_run/conf/cert.pem;
-    ssl_certificate_key /work/_run/conf/key.pem;
-    ssl_protocols TLSv1.3;
+              add_header alt-svc 'h3=":8443"; ma=86400' always;
 
-    add_header alt-svc 'h3=":8443"; ma=86400' always;
-
-    location = /error.html { root /work/_run/html; internal; }
-    location / { return 200 "ok\n"; }
-  }
-}
-CONF
+              location = /error.html { root /work/_run/html; internal; }
+              location / { return 200 "ok
+"; }
+            }
+          }
+          CONF
 
           /work/nginx -c /work/stealth_nginx.conf -p /work/_run/
 
@@ -369,22 +345,36 @@ CONF
           assert_no_server_header "http/1.1" --http1.1
           assert_no_server_header "http/2" --http2
 
-          # curl 的 HTTP/3 支持在不同构建上可能不可用；若不可用可替换为 nghttp3-client 等工具。
-          # 这里做“尽力验证”：若 curl 明确支持 --http3-only，则必须通过断言。
           if curl -h 2>&1 | grep -q -- '--http3-only'; then
             assert_no_server_header "http/3" --http3-only
           else
             echo "WARN: curl without --http3-only; skipping HTTP/3 assertion"
           fi
 
-          # FastCGI 模板泄露检查（安装目录中默认 conf）
           if grep -R "SERVER_SOFTWARE\s\+nginx/" -n "$PREFIX/conf" 2>/dev/null; then
             echo "FATAL: fastcgi template still leaks nginx/"
             exit 1
           fi
 
           /work/nginx -c /work/stealth_nginx.conf -p /work/_run/ -s quit || true
+
+          # -------------------------
+          # 7) 产出“可直接部署”的安装包（推荐）
+          # -------------------------
+          rm -rf /work/_pkg
+          mkdir -p /work/_pkg
+          make install DESTDIR=/work/_pkg
+
+          # 生成一个可在 VPS 上直接解压到 / 的包（含 conf、html、logs 目录结构）
+          tar -C /work/_pkg -czf /work/nginx-root.tar.gz .
+
+          echo "Package created: /work/nginx-root.tar.gz"
           BASH
+
+          chmod +x build.sh
+
+          # 2) 在 Debian 13 容器中执行脚本（无需 heredoc）
+          docker run --rm             -v "${{ github.workspace }}:/work"             -w /work             debian:trixie             bash -euxo pipefail /work/build.sh
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
@@ -393,5 +383,6 @@ CONF
           path: |
             ${{ github.workspace }}/nginx
             ${{ github.workspace }}/nginx_build_info.txt
+            ${{ github.workspace }}/nginx-root.tar.gz
             ${{ github.workspace }}/stealth_nginx.conf
           retention-days: 90
