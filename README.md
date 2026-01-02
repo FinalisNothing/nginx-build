@@ -4,6 +4,7 @@ This repo builds a custom nginx from upstream source inside a Debian 13 (trixie)
 
 - HTTP/1.1/2/3 `Server:` response header emission (compile-time gated)
 - `nginx -V` displayed version strings (`NGINX_VERSION` / `NGINX_VER*` made empty at build time)
+- Error page footer hardcoded `nginx` string (removed)
 - FastCGI templates no longer leak `nginx/$nginx_version` via `SERVER_SOFTWARE`
 
 ## How to build
