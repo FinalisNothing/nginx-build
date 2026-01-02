@@ -35,7 +35,17 @@ These macros are made empty in `src/core/nginx.h`:
 
 This affects display strings and header literals, but does not mutate internal numeric `nginx_version`.
 
-### 3) FastCGI templates
+### 3) Error page footer
+
+The hardcoded `nginx` string in error page footer (`server_tokens off` case) is removed:
+
+```c
+// Before: "<hr><center>nginx</center>"
+// After:  "<hr><center></center>"
+```
+
+File: `src/http/ngx_http_special_response.c`
+### 4) FastCGI templates
 
 Upstream nginx ships:
 - `conf/fastcgi.conf`
