@@ -52,7 +52,7 @@ jobs:
           apt-get update
           apt-get install -y --no-install-recommends \
             ca-certificates curl git patch python3 perl \
-            build-essential \
+            build-essential cmake \
             libpcre2-dev zlib1g-dev libssl-dev \
             libxslt1-dev libxml2-dev
 
@@ -92,6 +92,13 @@ jobs:
 
           # 第三方压缩模块源码（仅启用 Brotli，一个就够）
           git clone --depth 1 --recurse-submodules https://github.com/google/ngx_brotli.git ngx_brotli
+
+          cd ngx_brotli/deps/brotli
+          mkdir -p out
+          cd out
+          cmake -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF -DCMAKE_INSTALL_PREFIX=./installed ..
+          cmake --build . --config Release --target brotlienc
+          cd /work/_build
 
           cd "nginx-${NGINX_VER}"
 
