@@ -1,0 +1,374 @@
+name: build-nginx-stealth
+
+on:
+  workflow_dispatch:
+    inputs:
+      install_prefix:
+        description: "安装路径（prefix），例如 /nginx"
+        required: true
+        default: "/nginx"
+      channel:
+        description: "选择 latest 来源：mainline（奇数次版本）或 stable（偶数次版本）"
+        required: true
+        default: "mainline"
+        type: choice
+        options:
+          - mainline
+          - stable
+      fastcgi_server_software:
+        description: "FastCGI 的 SERVER_SOFTWARE（留空则设为空字符串）"
+        required: false
+        default: ""
+
+jobs:
+  build-nginx:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Pull Debian 13 (trixie) image
+        run: docker pull debian:trixie
+
+      - name: Build in Debian 13 container
+        env:
+          PREFIX: ${{ github.event.inputs.install_prefix }}
+          CHANNEL: ${{ github.event.inputs.channel }}
+          FASTCGI_SERVER_SOFTWARE: ${{ github.event.inputs.fastcgi_server_software }}
+        run: |
+          set -euxo pipefail
+
+          cat > build.sh <<'BASH'
+          #!/usr/bin/env bash
+          set -euxo pipefail
+
+          PREFIX="${PREFIX:?}"
+          CHANNEL="${CHANNEL:?}"
+          FASTCGI_SERVER_SOFTWARE="${FASTCGI_SERVER_SOFTWARE:-}"
+
+          export DEBIAN_FRONTEND=noninteractive
+
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            ca-certificates curl git patch python3 perl \
+            build-essential \
+            libpcre2-dev zlib1g-dev libssl-dev \
+            libxslt1-dev libxml2-dev
+
+          rm -rf /work/_build
+          mkdir -p /work/_build
+          cd /work/_build
+
+          # 选择 nginx 最新版本：
+          # - stable: 次版本号为偶数（例如 1.28.x）
+          # - mainline: 次版本号为奇数（例如 1.29.x）
+          versions="$(curl -fsSL https://nginx.org/download/ | grep -oE 'nginx-[0-9]+\.[0-9]+\.[0-9]+\.tar\.gz' | sed 's/^nginx-//;s/\.tar\.gz$//' | sort -Vu)"
+          if [ -z "$versions" ]; then
+            echo "FATAL: cannot parse nginx versions from nginx.org"
+            exit 1
+          fi
+
+          pick_version() {
+            local want="$1"
+            local v
+            if [ "$want" = "stable" ]; then
+              v="$(echo "$versions" | awk -F. '($2 % 2)==0 {print}' | tail -n1)"
+            else
+              v="$(echo "$versions" | awk -F. '($2 % 2)==1 {print}' | tail -n1)"
+            fi
+            if [ -z "$v" ]; then
+              echo "FATAL: cannot pick nginx version for channel=$want"
+              exit 1
+            fi
+            echo "$v"
+          }
+
+          NGINX_VER="$(pick_version "$CHANNEL")"
+          echo "[INFO] nginx version: ${NGINX_VER} (channel=${CHANNEL})"
+
+          curl -fsSLO "https://nginx.org/download/nginx-${NGINX_VER}.tar.gz"
+          tar -xzf "nginx-${NGINX_VER}.tar.gz"
+
+          # 第三方压缩模块源码（仅启用 Brotli，一个就够）
+          git clone --depth 1 --recurse-submodules https://github.com/google/ngx_brotli.git ngx_brotli
+
+          cd "nginx-${NGINX_VER}"
+
+          # ---------- 生成 stealth.patch（先改文件生成 diff，再恢复原文件） ----------
+          PATCH=/work/_build/stealth.patch
+          : > "$PATCH"
+
+          mkdiff_restore() {
+            local f="$1"
+            diff -u --label "a/$f" --label "b/$f" "$f.orig" "$f" >> "$PATCH" || true
+            mv -f "$f.orig" "$f"
+          }
+
+          # wrap.py：把每个文件中两处 `if (r->headers_out.server == NULL) { ... }` 用宏包起来
+          cat > /work/_build/wrap.py <<'PY'
+          import sys,re
+
+          path = sys.argv[1]
+          needle = "if (r->headers_out.server == NULL) {"
+
+          with open(path, "r", encoding="utf-8") as fh:
+              s = fh.read()
+
+          occ = [m.start() for m in re.finditer(re.escape(needle), s)]
+          if len(occ) != 2:
+              raise SystemExit(f"{path}: expected 2 occurrences, got {len(occ)}")
+
+          def wrap_at(txt: str, pos: int) -> str:
+              ls = txt.rfind("\n", 0, pos) + 1
+              indent = re.match(r"[ \t]*", txt[ls:pos]).group(0)
+
+              ins = f"{indent}#if !defined(NGX_STEALTH_NO_SERVER_HEADER)\n"
+              txt = txt[:ls] + ins + txt[ls:]
+              pos2 = pos + len(ins)
+
+              bo = txt.find("{", pos2)
+              if bo == -1:
+                  raise SystemExit(f"{path}: cannot find '{{' after if")
+
+              depth = 0
+              bc = None
+              for i, c in enumerate(txt[bo:], start=bo):
+                  if c == "{":
+                      depth += 1
+                  elif c == "}":
+                      depth -= 1
+                      if depth == 0:
+                          bc = i
+                          break
+              if bc is None:
+                  raise SystemExit(f"{path}: cannot find matching '}}'")
+
+              le = txt.find("\n", bc)
+              le = len(txt) if le == -1 else le + 1
+
+              return txt[:le] + f"{indent}#endif\n" + txt[le:]
+
+          for pos in sorted(occ, reverse=True):
+              ls = s.rfind("\n", 0, pos) + 1
+              if "NGX_STEALTH_NO_SERVER_HEADER" in s[max(0, ls-200):ls]:
+                  continue
+              s = wrap_at(s, pos)
+
+          # If we compiled out Server header emission, some file-scope Server strings become unused under -Werror.
+          # Wrap them too to avoid -Werror=unused-variable.
+          if path.endswith('src/http/ngx_http_header_filter_module.c'):
+              decls = [
+                  'static u_char ngx_http_server_string[]',
+                  'static u_char ngx_http_server_full_string[]',
+                  'static u_char ngx_http_server_build_string[]',
+              ]
+              idxs = []
+              for d in decls:
+                  m2 = re.search(r'^\s*' + re.escape(d) + r'.*$', s, flags=re.M)
+                  if not m2:
+                      raise SystemExit(f"{path}: missing declaration for {d}")
+                  idxs.append(m2.start())
+              first = min(idxs)
+              last = max(idxs)
+              ls0 = s.rfind("\n", 0, first) + 1
+              indent0 = re.match(r"[ \t]*", s[ls0:first]).group(0)
+              guard = f"{indent0}#if !defined(NGX_STEALTH_NO_SERVER_HEADER)\n"
+              if 'NGX_STEALTH_NO_SERVER_HEADER' not in s[max(0, ls0-200):ls0]:
+                  s = s[:ls0] + guard + s[ls0:]
+                  last += len(guard)
+              le = s.find("\n", last)
+              le = len(s) if le == -1 else le + 1
+              endif = f"{indent0}#endif\n"
+              if 'NGX_STEALTH_NO_SERVER_HEADER' not in s[max(0, le-200):le]:
+                  s = s[:le] + endif + s[le:]
+
+          # HTTP/2 module: function-local static variables for Server header
+          # Must wrap TWO separate groups (accept_encoding is between them for GZIP)
+          if path.endswith('src/http/v2/ngx_http_v2_filter_module.c'):
+              # Group 1: nginx HPACK constant
+              m1 = re.search(r'^(\s*)(static const u_char nginx\[5\].*?;)', s, flags=re.M)
+              if m1:
+                  ls0 = s.rfind("\n", 0, m1.start()) + 1
+                  indent0 = m1.group(1)
+                  le = s.find("\n", m1.end())
+                  le = len(s) if le == -1 else le + 1
+                  if 'NGX_STEALTH_NO_SERVER_HEADER' not in s[max(0, ls0-200):le]:
+                      guard = f"{indent0}#if !defined(NGX_STEALTH_NO_SERVER_HEADER)\n"
+                      endif = f"{indent0}#endif\n"
+                      s = s[:ls0] + guard + s[ls0:le] + endif + s[le:]
+
+              # Group 2: nginx_ver_len, nginx_ver, nginx_ver_build_len, nginx_ver_build
+              v2_decls = [
+                  'static size_t nginx_ver_len',
+                  'static u_char nginx_ver[',
+                  'static size_t nginx_ver_build_len',
+                  'static u_char nginx_ver_build[',
+              ]
+              idxs = []
+              for d in v2_decls:
+                  m2 = re.search(r'^\s*' + re.escape(d) + r'.*$', s, flags=re.M)
+                  if m2:
+                      idxs.append((m2.start(), m2.end()))
+              if idxs:
+                  first = min(i[0] for i in idxs)
+                  last_end = max(i[1] for i in idxs)
+                  ls0 = s.rfind("\n", 0, first) + 1
+                  indent0 = re.match(r"[ \t]*", s[ls0:first]).group(0)
+                  le = s.find("\n", last_end)
+                  le = len(s) if le == -1 else le + 1
+                  if 'NGX_STEALTH_NO_SERVER_HEADER' not in s[max(0, ls0-200):le]:
+                      guard = f"{indent0}#if !defined(NGX_STEALTH_NO_SERVER_HEADER)\n"
+                      endif = f"{indent0}#endif\n"
+                      s = s[:ls0] + guard + s[ls0:le] + endif + s[le:]
+          with open(path, "w", encoding="utf-8") as fh:
+              fh.write(s)
+          PY
+
+          pre_assert() {
+            local f="$1"
+            local n
+            n="$(grep -c 'if (r->headers_out\.server == NULL)' "$f" || true)"
+            if [ "$n" -ne 2 ]; then
+              echo "FATAL: $f expected 2 occurrences, got $n"
+              exit 1
+            fi
+          }
+
+          wrap_file() {
+            local f="$1"
+            cp "$f" "$f.orig"
+            python3 /work/_build/wrap.py "$f"
+            mkdiff_restore "$f"
+          }
+
+          # 1) Server 头：HTTP/1, HTTP/2, HTTP/3 三协议（每个文件两处）
+          pre_assert src/http/ngx_http_header_filter_module.c
+          pre_assert src/http/v2/ngx_http_v2_filter_module.c
+          pre_assert src/http/v3/ngx_http_v3_filter_module.c
+          wrap_file src/http/ngx_http_header_filter_module.c
+          wrap_file src/http/v2/ngx_http_v2_filter_module.c
+          wrap_file src/http/v3/ngx_http_v3_filter_module.c
+
+          # 1.5) 错误页 footer 硬编码 nginx（server_tokens off 时使用）
+          cp src/http/ngx_http_special_response.c src/http/ngx_http_special_response.c.orig
+          sed -i 's/<hr><center>nginx<\/center>/<hr><center><\/center>/g' src/http/ngx_http_special_response.c
+          mkdiff_restore src/http/ngx_http_special_response.c
+
+          # 2) NGINX_VERSION / NGINX_VER：仅展示层（不动 nginx_version 数值、不动 NGINX_VAR）
+          cp src/core/nginx.h src/core/nginx.h.orig
+          python3 - <<'PY'
+          import re
+          path="src/core/nginx.h"
+          s=open(path,"r",encoding="utf-8").read()
+          s=re.sub(r'^(#define\s+NGINX_VERSION\s+)"[^"]*"\s*$', r'\1""', s, flags=re.M)
+          s=re.sub(r'^(#define\s+NGINX_VER\s+).*$' , r'\1""', s, flags=re.M)
+          s=re.sub(r'^(#define\s+NGINX_VER_BUILD\s+).*$' , r'\1""', s, flags=re.M)
+          open(path,"w",encoding="utf-8").write(s)
+          PY
+          mkdiff_restore src/core/nginx.h
+
+          # 3) FastCGI 模板：SERVER_SOFTWARE 不应包含 nginx/$nginx_version
+          for f in conf/fastcgi.conf conf/fastcgi_params; do
+            if [ -f "$f" ]; then
+              cp "$f" "$f.orig"
+              python3 - "$f" "$FASTCGI_SERVER_SOFTWARE" <<'PY'
+          import sys,re
+          path=sys.argv[1]
+          val=sys.argv[2]
+          if val == "":
+              rep='fastcgi_param  SERVER_SOFTWARE    "";\n'
+          else:
+              v=val.replace('\\','\\\\').replace('"','\\"')
+              rep=f'fastcgi_param  SERVER_SOFTWARE    "{v}";\n'
+          s=open(path,"r",encoding="utf-8").read()
+          s=re.sub(r'^fastcgi_param\s+SERVER_SOFTWARE\s+.*?;\s*$', rep.rstrip("\n"), s, flags=re.M)
+          open(path,"w",encoding="utf-8").write(s+"\n" if not s.endswith("\n") else s)
+          PY
+              mkdiff_restore "$f"
+            fi
+          done
+
+          # patch 质量门禁
+          if ! grep -q '^--- a/' "$PATCH" || ! grep -q '^@@' "$PATCH"; then
+            echo "FATAL: generated stealth.patch is empty or not a unified diff"
+            ls -l "$PATCH" || true
+            sed -n '1,200p' "$PATCH" || true
+            exit 1
+          fi
+
+          # 预演 + 严格应用（fuzz=0）
+          patch -p1 --dry-run --fuzz=0 < "$PATCH"
+          patch -p1 --fuzz=0 < "$PATCH"
+
+          # post-check：确认宏被插入
+          for f in src/http/ngx_http_header_filter_module.c src/http/v2/ngx_http_v2_filter_module.c src/http/v3/ngx_http_v3_filter_module.c; do
+            if ! grep -q 'NGX_STEALTH_NO_SERVER_HEADER' "$f"; then
+              echo "FATAL: post-patch check failed: $f not wrapped"
+              exit 1
+            fi
+          done
+
+          # ---------- 编译 ----------
+          CC_OPT="-O3 -march=x86-64-v2 -mtune=ivybridge -funroll-loops -fprefetch-loop-arrays -fstack-protector-strong -Wformat -Werror=format-security -D_FORTIFY_SOURCE=2 -fPIC -pipe -flto -DNGX_STEALTH_NO_SERVER_HEADER"
+          LD_OPT="-Wl,-z,relro -Wl,-z,now -flto"
+
+          ./configure \
+            --prefix="$PREFIX" \
+            --sbin-path="$PREFIX/sbin/nginx" \
+            --conf-path="$PREFIX/conf/nginx.conf" \
+            --pid-path="$PREFIX/logs/nginx.pid" \
+            --lock-path="$PREFIX/logs/nginx.lock" \
+            --error-log-path="$PREFIX/logs/error.log" \
+            --http-log-path="$PREFIX/logs/access.log" \
+            --with-compat \
+            --with-threads \
+            --with-file-aio \
+            --with-http_ssl_module \
+            --with-http_v2_module \
+            --with-http_v3_module \
+            --with-http_grpc_module \
+            --with-http_realip_module \
+            --with-http_sub_module \
+            --with-http_gzip_static_module \
+            --with-http_stub_status_module \
+            --with-stream \
+            --with-stream_ssl_module \
+            --with-stream_ssl_preread_module \
+            --with-pcre-jit \
+            --add-module=../ngx_brotli \
+            --with-cc-opt="$CC_OPT" \
+            --with-ld-opt="$LD_OPT"
+
+          make -j"$(nproc)"
+          ./objs/nginx -V 2>&1 | tee /work/nginx_build_info.txt
+          cp ./objs/nginx /work/nginx
+
+          make install DESTDIR=/work/_pkg
+
+          tar -C /work/_pkg -czf /work/nginx-root.tar.gz .
+
+          cp /work/_build/stealth.patch /work/stealth.patch
+
+          sha256sum /work/nginx-root.tar.gz /work/nginx /work/nginx_build_info.txt /work/stealth.patch > /work/SHA256SUMS.txt
+          echo "[OK] build completed"
+          BASH
+
+          chmod +x build.sh
+
+          docker run --rm \
+            -e PREFIX -e CHANNEL -e FASTCGI_SERVER_SOFTWARE \
+            -v "$PWD:/work" -w /work \
+            debian:trixie \
+            bash -euxo pipefail /work/build.sh
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: nginx-stealth-artifacts
+          path: |
+            nginx-root.tar.gz
+            stealth.patch
+            nginx_build_info.txt
+            nginx
+            SHA256SUMS.txt
