@@ -1,0 +1,2 @@
+Place custom error page HTML files here (e.g., 502.html, 504.html).
+They will be included in nginx-root.tar.gz during the GitHub Action build.

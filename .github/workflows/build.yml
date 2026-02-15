@@ -352,6 +352,15 @@ jobs:
 
           make install DESTDIR=/work/_pkg
 
+          # Pre-populate error pages directory and ACME challenge directory
+          mkdir -p /work/_pkg/nginx/html/errors
+          mkdir -p /work/_pkg/nginx/acme_challenge/.well-known/acme-challenge
+
+          # Copy error page HTML files if present in the repo
+          if [ -d /work/html/errors ] && ls /work/html/errors/*.html >/dev/null 2>&1; then
+              cp /work/html/errors/*.html /work/_pkg/nginx/html/errors/
+          fi
+
           tar -C /work/_pkg -czf /work/nginx-root.tar.gz .
 
           cp /work/_build/stealth.patch /work/stealth.patch
@@ -373,6 +382,31 @@ jobs:
         with:
           name: nginx-stealth-artifacts
           path: |
+            nginx-root.tar.gz
+            stealth.patch
+            nginx_build_info.txt
+            nginx
+            SHA256SUMS.txt
+
+      - name: Determine nginx version for tag
+        id: version
+        run: |
+          NGINX_VER=$(grep -oP 'nginx version: nginx/\K[0-9.]+' nginx_build_info.txt || echo "unknown")
+          TAG="nginx-${NGINX_VER}-$(date +%Y%m%d%H%M%S)"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "nginx_ver=$NGINX_VER" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: "nginx ${{ steps.version.outputs.nginx_ver }}"
+          body: |
+            Stealth nginx build (${{ github.event.inputs.channel }} channel)
+
+            Built on Debian 13 (trixie) with Brotli support.
+            Prefix: `${{ github.event.inputs.install_prefix }}`
+          files: |
             nginx-root.tar.gz
             stealth.patch
             nginx_build_info.txt
