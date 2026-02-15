@@ -20,6 +20,9 @@ on:
         required: false
         default: ""
 
+permissions:
+  contents: write
+
 jobs:
   build-nginx:
     runs-on: ubuntu-latest
@@ -366,6 +369,7 @@ jobs:
           cp /work/_build/stealth.patch /work/stealth.patch
 
           sha256sum /work/nginx-root.tar.gz /work/nginx /work/nginx_build_info.txt /work/stealth.patch > /work/SHA256SUMS.txt
+          echo "$NGINX_VER" > /work/nginx_version.txt
           echo "[OK] build completed"
           BASH
 
@@ -385,13 +389,14 @@ jobs:
             nginx-root.tar.gz
             stealth.patch
             nginx_build_info.txt
+            nginx_version.txt
             nginx
             SHA256SUMS.txt
 
       - name: Determine nginx version for tag
         id: version
         run: |
-          NGINX_VER=$(grep -oP 'nginx version: nginx/\K[0-9.]+' nginx_build_info.txt || echo "unknown")
+          NGINX_VER=$(cat nginx_version.txt 2>/dev/null || echo "unknown")
           TAG="nginx-${NGINX_VER}-$(date +%Y%m%d%H%M%S)"
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "nginx_ver=$NGINX_VER" >> "$GITHUB_OUTPUT"
@@ -410,5 +415,6 @@ jobs:
             nginx-root.tar.gz
             stealth.patch
             nginx_build_info.txt
+            nginx_version.txt
             nginx
             SHA256SUMS.txt
