@@ -19,11 +19,18 @@ Inputs:
 | `fastcgi_server_software` | Value for `fastcgi_param SERVER_SOFTWARE` | `""` (empty) |
 
 Artifacts produced:
-- `nginx-root.tar.gz`: install tree (untar at `/`)
+- `nginx-root.tar.gz`: install tree (untar at `/`), includes pre-created `html/errors/` and `acme_challenge/` directories
 - `nginx`: standalone binary
-- `nginx_build_info.txt`: output of `nginx -V`
+- `nginx_build_info.txt`: output of `nginx -V` (version strings are empty due to stealth patch)
+- `nginx_version.txt`: actual nginx version number used in the build
 - `stealth.patch`: generated unified diff applied to nginx source
 - `SHA256SUMS.txt`: checksums for integrity
+
+Each successful build also creates a **GitHub Release** with all artifacts attached. The latest build can be downloaded directly:
+
+```
+https://github.com/FinalisNothing/nginx-build/releases/latest/download/nginx-root.tar.gz
+```
 
 ## Install on Debian 13 VPS
 
@@ -32,6 +39,12 @@ sudo tar -C / -xzf nginx-root.tar.gz
 /nginx/sbin/nginx -V
 sudo /nginx/sbin/nginx -t -c /nginx/conf/nginx.conf
 ```
+
+The tarball includes these pre-created directories:
+- `/nginx/html/errors/` — custom error pages (502.html, 504.html); served only via `error_page` internal redirect
+- `/nginx/acme_challenge/.well-known/acme-challenge/` — webroot for ACME certificate verification
+
+To add or update error pages, place `.html` files in `html/errors/` in this repo and re-run the workflow.
 
 ## systemd service
 
