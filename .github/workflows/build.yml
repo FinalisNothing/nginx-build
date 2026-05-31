@@ -19,12 +19,92 @@ on:
         description: "FastCGI 的 SERVER_SOFTWARE（留空则设为空字符串）"
         required: false
         default: ""
+      cpu_baseline:
+        description: "编译目标 CPU 基线（-march），如 x86-64-v2 / x86-64-v3；留空用默认"
+        required: false
+        default: "x86-64-v2"
+  # 定时构建：每周一 04:00 UTC 检查 nginx 是否发布了新版本；有新版本才构建并发布 Release。
+  # 使用默认参数（mainline / prefix=/nginx / 空 SERVER_SOFTWARE / x86-64-v2）。
+  schedule:
+    - cron: "0 4 * * 1"
 
 permissions:
   contents: write
 
 jobs:
+  # 解析有效参数（定时触发时无表单输入，回退到默认值），并判断是否需要构建。
+  resolve:
+    runs-on: ubuntu-latest
+    outputs:
+      channel: ${{ steps.cfg.outputs.channel }}
+      prefix: ${{ steps.cfg.outputs.prefix }}
+      fastcgi: ${{ steps.cfg.outputs.fastcgi }}
+      cpu_baseline: ${{ steps.cfg.outputs.cpu_baseline }}
+      nginx_ver: ${{ steps.ver.outputs.nginx_ver }}
+      should_build: ${{ steps.ver.outputs.should_build }}
+    steps:
+      - name: Resolve effective inputs (defaults for scheduled runs)
+        id: cfg
+        env:
+          IN_CHANNEL: ${{ github.event.inputs.channel }}
+          IN_PREFIX: ${{ github.event.inputs.install_prefix }}
+          IN_FASTCGI: ${{ github.event.inputs.fastcgi_server_software }}
+          IN_BASELINE: ${{ github.event.inputs.cpu_baseline }}
+        run: |
+          set -euo pipefail
+          {
+            echo "channel=${IN_CHANNEL:-mainline}"
+            echo "prefix=${IN_PREFIX:-/nginx}"
+            echo "fastcgi=${IN_FASTCGI:-}"
+            echo "cpu_baseline=${IN_BASELINE:-x86-64-v2}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Determine latest nginx version and whether to build
+        id: ver
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          CHANNEL: ${{ steps.cfg.outputs.channel }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          versions="$(curl -fsSL https://nginx.org/download/ \
+            | grep -oE 'nginx-[0-9]+\.[0-9]+\.[0-9]+\.tar\.gz' \
+            | sed 's/^nginx-//;s/\.tar\.gz$//' | sort -Vu)"
+          if [ -z "$versions" ]; then
+            echo "FATAL: cannot parse nginx versions from nginx.org" >&2
+            exit 1
+          fi
+          if [ "$CHANNEL" = "stable" ]; then
+            NGINX_VER="$(echo "$versions" | awk -F. '($2 % 2)==0 {print}' | tail -n1)"
+          else
+            NGINX_VER="$(echo "$versions" | awk -F. '($2 % 2)==1 {print}' | tail -n1)"
+          fi
+          if [ -z "$NGINX_VER" ]; then
+            echo "FATAL: cannot pick nginx version for channel=$CHANNEL" >&2
+            exit 1
+          fi
+          echo "nginx_ver=$NGINX_VER" >> "$GITHUB_OUTPUT"
+          echo "[INFO] latest $CHANNEL nginx version: $NGINX_VER"
+
+          # 手动触发：总是构建。定时触发：仅当该版本尚无 Release 时才构建，避免重复发布。
+          if [ "$EVENT_NAME" != "schedule" ]; then
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          existing="$(gh release list --limit 200 --json tagName --jq '.[].tagName' 2>/dev/null || true)"
+          # 版本号与 channel 一一对应（奇偶次版本不重叠），按版本号去重即可。
+          if printf '%s\n' "$existing" | grep -q "^nginx-${NGINX_VER}-"; then
+            echo "[INFO] release for nginx-${NGINX_VER} already exists; skip."
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "[INFO] no release for nginx-${NGINX_VER}; will build."
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+          fi
+
   build-nginx:
+    needs: resolve
+    if: needs.resolve.outputs.should_build == 'true'
     runs-on: ubuntu-latest
 
     steps:
@@ -36,9 +116,11 @@ jobs:
 
       - name: Build in Debian 13 container
         env:
-          PREFIX: ${{ github.event.inputs.install_prefix }}
-          CHANNEL: ${{ github.event.inputs.channel }}
-          FASTCGI_SERVER_SOFTWARE: ${{ github.event.inputs.fastcgi_server_software }}
+          PREFIX: ${{ needs.resolve.outputs.prefix }}
+          CHANNEL: ${{ needs.resolve.outputs.channel }}
+          FASTCGI_SERVER_SOFTWARE: ${{ needs.resolve.outputs.fastcgi }}
+          NGINX_VER: ${{ needs.resolve.outputs.nginx_ver }}
+          CPU_BASELINE: ${{ needs.resolve.outputs.cpu_baseline }}
         run: |
           set -euxo pipefail
 
@@ -49,6 +131,8 @@ jobs:
           PREFIX="${PREFIX:?}"
           CHANNEL="${CHANNEL:?}"
           FASTCGI_SERVER_SOFTWARE="${FASTCGI_SERVER_SOFTWARE:-}"
+          NGINX_VER="${NGINX_VER:-}"
+          CPU_BASELINE="${CPU_BASELINE:-x86-64-v2}"
 
           export DEBIAN_FRONTEND=noninteractive
 
@@ -63,31 +147,34 @@ jobs:
           mkdir -p /work/_build
           cd /work/_build
 
-          # 选择 nginx 最新版本：
+          # 选择 nginx 版本：
+          # 正常情况下由 resolve 作业解析后通过 NGINX_VER 注入；若为空则在此回退检测。
           # - stable: 次版本号为偶数（例如 1.28.x）
           # - mainline: 次版本号为奇数（例如 1.29.x）
-          versions="$(curl -fsSL https://nginx.org/download/ | grep -oE 'nginx-[0-9]+\.[0-9]+\.[0-9]+\.tar\.gz' | sed 's/^nginx-//;s/\.tar\.gz$//' | sort -Vu)"
-          if [ -z "$versions" ]; then
-            echo "FATAL: cannot parse nginx versions from nginx.org"
-            exit 1
-          fi
-
-          pick_version() {
-            local want="$1"
-            local v
-            if [ "$want" = "stable" ]; then
-              v="$(echo "$versions" | awk -F. '($2 % 2)==0 {print}' | tail -n1)"
-            else
-              v="$(echo "$versions" | awk -F. '($2 % 2)==1 {print}' | tail -n1)"
-            fi
-            if [ -z "$v" ]; then
-              echo "FATAL: cannot pick nginx version for channel=$want"
+          if [ -z "$NGINX_VER" ]; then
+            versions="$(curl -fsSL https://nginx.org/download/ | grep -oE 'nginx-[0-9]+\.[0-9]+\.[0-9]+\.tar\.gz' | sed 's/^nginx-//;s/\.tar\.gz$//' | sort -Vu)"
+            if [ -z "$versions" ]; then
+              echo "FATAL: cannot parse nginx versions from nginx.org"
               exit 1
             fi
-            echo "$v"
-          }
 
-          NGINX_VER="$(pick_version "$CHANNEL")"
+            pick_version() {
+              local want="$1"
+              local v
+              if [ "$want" = "stable" ]; then
+                v="$(echo "$versions" | awk -F. '($2 % 2)==0 {print}' | tail -n1)"
+              else
+                v="$(echo "$versions" | awk -F. '($2 % 2)==1 {print}' | tail -n1)"
+              fi
+              if [ -z "$v" ]; then
+                echo "FATAL: cannot pick nginx version for channel=$want"
+                exit 1
+              fi
+              echo "$v"
+            }
+
+            NGINX_VER="$(pick_version "$CHANNEL")"
+          fi
           echo "[INFO] nginx version: ${NGINX_VER} (channel=${CHANNEL})"
 
           curl -fsSLO "https://nginx.org/download/nginx-${NGINX_VER}.tar.gz"
@@ -320,7 +407,7 @@ jobs:
           done
 
           # ---------- 编译 ----------
-          CC_OPT="-O3 -march=x86-64-v2 -mtune=ivybridge -funroll-loops -fprefetch-loop-arrays -fstack-protector-strong -Wformat -Werror=format-security -D_FORTIFY_SOURCE=2 -fPIC -pipe -flto -DNGX_STEALTH_NO_SERVER_HEADER"
+          CC_OPT="-O3 -march=${CPU_BASELINE} -mtune=ivybridge -funroll-loops -fprefetch-loop-arrays -fstack-protector-strong -Wformat -Werror=format-security -D_FORTIFY_SOURCE=2 -fPIC -pipe -flto -DNGX_STEALTH_NO_SERVER_HEADER"
           LD_OPT="-Wl,-z,relro -Wl,-z,now -flto"
 
           ./configure \
@@ -376,7 +463,7 @@ jobs:
           chmod +x build.sh
 
           docker run --rm \
-            -e PREFIX -e CHANNEL -e FASTCGI_SERVER_SOFTWARE \
+            -e PREFIX -e CHANNEL -e FASTCGI_SERVER_SOFTWARE -e NGINX_VER -e CPU_BASELINE \
             -v "$PWD:/work" -w /work \
             debian:trixie \
             bash -euxo pipefail /work/build.sh
@@ -407,10 +494,11 @@ jobs:
           tag_name: ${{ steps.version.outputs.tag }}
           name: "nginx ${{ steps.version.outputs.nginx_ver }}"
           body: |
-            Stealth nginx build (${{ github.event.inputs.channel }} channel)
+            Stealth nginx build (${{ needs.resolve.outputs.channel }} channel)
 
             Built on Debian 13 (trixie) with Brotli support.
-            Prefix: `${{ github.event.inputs.install_prefix }}`
+            Prefix: `${{ needs.resolve.outputs.prefix }}`
+            CPU baseline: `${{ needs.resolve.outputs.cpu_baseline }}`
           files: |
             nginx-root.tar.gz
             stealth.patch
