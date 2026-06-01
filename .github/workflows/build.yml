@@ -455,8 +455,17 @@ jobs:
 
           cp /work/_build/stealth.patch /work/stealth.patch
 
-          sha256sum /work/nginx-root.tar.gz /work/nginx /work/nginx_build_info.txt /work/stealth.patch > /work/SHA256SUMS.txt
           echo "$NGINX_VER" > /work/nginx_version.txt
+          (
+            cd /work
+            sha256sum \
+              nginx-root.tar.gz \
+              nginx \
+              nginx_build_info.txt \
+              nginx_version.txt \
+              stealth.patch \
+              > SHA256SUMS.txt
+          )
           echo "[OK] build completed"
           BASH
 
